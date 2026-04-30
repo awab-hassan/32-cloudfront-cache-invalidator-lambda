@@ -1,89 +1,58 @@
-# CloudFront Cache Invalidator Lambda
+# Project 32: CloudFront Cache Invalidator Lambda
 
-Python 3.9 Lambda function that performs on-demand CloudFront cache invalidations for user-profile style URLs, scoped to a single distribution. Accepts a `profileUrl` from three sources (query string, raw query string, or JSON body), normalises it, then issues a `CreateInvalidation` call against three path patterns — the exact URL, its subtree, and its query-string variants — so a single request purges every cached variant of a changed profile.
+A Python 3.9 AWS Lambda function that performs targeted CloudFront cache invalidations for user-profile style URLs. The handler accepts a `profileUrl` from any of three input sources, normalises it, and issues a single `CreateInvalidation` call covering three path patterns: the exact URL, its subtree, and its query-string variants. One request purges every cached variant of a changed resource.
 
-## Highlights
+## Why It Exists
 
-- **Three path patterns in one call** — for input `/users/42`, issues an invalidation for `/users/42`, `/users/42/*`, `/users/42?*`. Covers sub-pages and cache-busted variants in a single CloudFront call (one billable invalidation).
-- **Triple input handling** — works as a Function URL (`queryStringParameters`), as an API Gateway REST/HTTP integration (`rawQueryString`), and as a direct SDK invoke (`event.profileUrl`). One handler, three integration options.
-- **Least-privilege IAM** — the Terraform module scopes `cloudfront:CreateInvalidation` / `GetInvalidation` to a single distribution ARN, not `*`.
-- **Structured JSON responses** — returns `{ message, result: { invalidationId, status, paths } }` on success, `{ error }` with the right HTTP status on failure; `Content-Type: application/json` always set.
-- **Batteries-included Terraform** — IAM role, IAM policy, CloudWatch Logs attachment, and Lambda function all defined in one file with exportable `lambda_arn` / `lambda_function_name` outputs.
+When a user profile, article, or any cacheable resource is updated, the application needs to flush every cached representation of it from CloudFront edge locations: the canonical URL, sub-pages under it (`/users/42/photos`, `/users/42/posts`), and any cache-busted variants with query strings (`/users/42?v=2`). Doing this in three separate API calls is wasteful. This Lambda batches all three patterns into a single `CreateInvalidation` call.
 
-## Architecture
+## How It Works
 
 ```
- Any upstream service (admin UI, CMS webhook, profile-update API)
-              │
-              │  { "profileUrl": "/users/42" }
-              ▼
- Lambda (Python 3.9, 128 MB, 30 s timeout)
-   ├─ normalise URL (prepend "/" if missing)
-   ├─ build patterns [url, url/*, url?*]
-   └─ cloudfront.create_invalidation(DistributionId=E3FUR8VHNU616N, Paths=...)
-              │
-              ▼
- CloudFront distribution  →  edge caches drop those paths
+Caller (admin UI, CMS webhook, profile-update API, etc.)
+        |
+        | { "profileUrl": "/users/42" }
+        v
+Lambda (Python 3.9, 128 MB, 30s timeout)
+   1. Locate profileUrl in event (3 input sources, see below)
+   2. Normalise URL (prepend "/" if missing)
+   3. Build invalidation patterns:
+        /users/42
+        /users/42/*      (subtree)
+        /users/42?*      (query-string variants)
+   4. cloudfront.create_invalidation(DistributionId, Paths, CallerReference=time.time())
+        |
+        v
+CloudFront distribution -> edge caches drop those paths
 ```
 
-## Tech stack
+### Input Source Resolution
 
-- **Runtime:** Python 3.9
-- **Libraries:** `boto3` (built into the Lambda runtime)
-- **Infrastructure:** Terraform
-- **AWS services:** Lambda, CloudFront (CreateInvalidation), IAM, CloudWatch Logs
+The handler works as a Lambda Function URL, an API Gateway integration, or a direct SDK invoke. It searches for `profileUrl` in this order:
 
-## Repository layout
+1. `event.queryStringParameters.profileUrl` — Function URL or API Gateway with parsed query string
+2. `event.rawQueryString` — API Gateway HTTP API with raw query string
+3. `event.body` — POST request body, parsed as JSON
+4. `event.profileUrl` — direct SDK invoke with a flat payload
 
-```
-LAMBDA-CLOUDFRONT-CACHE/
-├── README.md
-├── .gitignore
-├── invalidate_cache.py   # Lambda handler
-└── main.tf               # IAM + Lambda + logging
-```
+Whichever source supplies the value first wins. This lets the same Lambda be wired into three different integration patterns without modification.
 
-## How it works
+### Path Pattern Logic
 
-1. Caller invokes the Lambda (Function URL, API Gateway, or direct SDK) with a `profileUrl`.
-2. Handler locates `profileUrl` in `event.queryStringParameters`, then `event.rawQueryString`, then `event.body` (parsed as JSON), then the top-level `event` — whichever is present.
-3. Normalises the URL to ensure it starts with `/`.
-4. Builds three invalidation patterns and calls `cloudfront.create_invalidation` with a `CallerReference` derived from `time.time()` (so retries aren't deduplicated by CloudFront).
-5. Returns `200` with the invalidation ID, status, and paths on success; `400` if `profileUrl` is missing; `500` for unexpected exceptions (details in CloudWatch Logs only).
+For an input of `/users/42`, the handler builds:
 
-## Prerequisites
+| Pattern | Purpose |
+|---|---|
+| `/users/42` | The exact resource URL |
+| `/users/42/*` | Any sub-pages under the resource (e.g. `/users/42/photos`, `/users/42/posts`) |
+| `/users/42?*` | Any cache-busted variants (`/users/42?v=2`, `/users/42?lang=en`) |
 
-- Terraform >= 1.x
-- Python 3.9
-- AWS CLI configured with permissions to create IAM roles, Lambda functions, and manage CloudFront
-- A real CloudFront distribution ID — replace `E3FUR8VHNU616N` in both `invalidate_cache.py` (`CLOUDFRONT_ID`) and `main.tf` (IAM resource ARN)
+CloudFront treats this as 3 paths in 1 invalidation request, which keeps the API call count low. Note that CloudFront's free tier of 1,000 invalidation paths per month counts paths, not requests, so batching saves API overhead but not direct CloudFront cost beyond the free tier.
 
-## Deployment
+### Response Shape
 
-```bash
-# Package the function
-zip invalidate_cache.zip invalidate_cache.py
+Success (HTTP 200):
 
-# Apply infrastructure
-terraform init
-terraform plan
-terraform apply
-```
-
-To expose it as an HTTP endpoint, either add a Lambda Function URL (`aws lambda create-function-url-config`) or wire it behind API Gateway.
-
-## Example invocation
-
-```bash
-# Direct Lambda invoke
-aws lambda invoke --function-name cloudfront_cache_invalidator \
-  --payload '{"profileUrl": "/users/42"}' out.json
-
-# HTTP (Function URL)
-curl "https://<fn-url>/?profileUrl=/users/42"
-```
-
-Response:
 ```json
 {
   "message": "Cache invalidation initiated",
@@ -95,6 +64,60 @@ Response:
 }
 ```
 
+Failure cases:
+- `400` — `profileUrl` missing or empty
+- `500` — unexpected exception. Error details are written to CloudWatch Logs only, not returned to the caller.
+
+`Content-Type: application/json` is set on every response.
+
+## What Gets Provisioned
+
+The included Terraform module provisions everything in one apply:
+
+- IAM execution role for the Lambda
+- IAM policy scoped to `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` against a single distribution ARN (not `*`)
+- CloudWatch Logs permissions
+- Lambda function (Python 3.9, 128 MB, 30 second timeout)
+
+Outputs `lambda_arn` and `lambda_function_name` are exported for downstream wiring.
+
+## Stack
+
+Python 3.9 · boto3 · Terraform · AWS Lambda · CloudFront · IAM · CloudWatch Logs
+
+## Prerequisites
+
+- Terraform >= 1.x
+- AWS credentials with permissions to create IAM roles, Lambda functions, and reference an existing CloudFront distribution
+- A CloudFront distribution ID. Replace `<distribution-id>` in both `invalidate_cache.py` (`CLOUDFRONT_ID`) and `main.tf` (IAM resource ARN), or parameterise as a Terraform variable
+
+## Deployment
+
+```bash
+zip invalidate_cache.zip invalidate_cache.py
+
+terraform init
+terraform plan
+terraform apply
+```
+
+To expose the Lambda over HTTP, either add a Lambda Function URL via `aws lambda create-function-url-config`, or place it behind an API Gateway.
+
+## Example Invocations
+
+Direct SDK invoke:
+
+```bash
+aws lambda invoke --function-name cloudfront_cache_invalidator \
+  --payload '{"profileUrl": "/users/42"}' out.json
+```
+
+Function URL (HTTP GET):
+
+```bash
+curl "https://<fn-url>/?profileUrl=/users/42"
+```
+
 ## Teardown
 
 ```bash
@@ -103,6 +126,8 @@ terraform destroy
 
 ## Notes
 
-- CloudFront currently charges for invalidations beyond 1,000 paths/month — batching the three patterns in a single call counts as 3 paths, not 3 invalidations, which is cheaper.
-- The hardcoded distribution ID should be parameterised via a Terraform `variable` before re-use in another account.
-- Demonstrates: CloudFront operational automation, multi-source event parsing in a single Lambda handler, scoped IAM, Terraform-packaged serverless unit.
+- The CloudFront distribution ID is hardcoded in both `invalidate_cache.py` and the IAM policy in `main.tf`. Parameterise both as Terraform variables before reusing across accounts or distributions.
+- `CallerReference` uses `time.time()`. Two invalidations issued within the same second could be deduplicated by CloudFront. Switch to `uuid.uuid4()` for fully idempotent retry semantics.
+- The Lambda has no authentication if exposed via Function URL. Add IAM auth or place it behind API Gateway with an authorizer before exposing externally.
+- Error responses to clients are intentionally minimal (`{"error": "..."}`). Full exception traces stay in CloudWatch Logs, not in API responses.
+- CloudFront's free tier is 1,000 invalidation paths per month. Beyond that, each path is billed at the published rate. Batching three patterns in one call saves API request overhead, not per-path cost.
