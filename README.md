@@ -6,25 +6,8 @@ A Python 3.9 AWS Lambda function that performs targeted CloudFront cache invalid
 
 When a user profile, article, or any cacheable resource is updated, the application needs to flush every cached representation of it from CloudFront edge locations: the canonical URL, sub-pages under it (`/users/42/photos`, `/users/42/posts`), and any cache-busted variants with query strings (`/users/42?v=2`). Doing this in three separate API calls is wasteful. This Lambda batches all three patterns into a single `CreateInvalidation` call.
 
-## How It Works
-
-```
-Caller (admin UI, CMS webhook, profile-update API, etc.)
-        |
-        | { "profileUrl": "/users/42" }
-        v
-Lambda (Python 3.9, 128 MB, 30s timeout)
-   1. Locate profileUrl in event (3 input sources, see below)
-   2. Normalise URL (prepend "/" if missing)
-   3. Build invalidation patterns:
-        /users/42
-        /users/42/*      (subtree)
-        /users/42?*      (query-string variants)
-   4. cloudfront.create_invalidation(DistributionId, Paths, CallerReference=time.time())
-        |
-        v
-CloudFront distribution -> edge caches drop those paths
-```
+## Architecture
+![Architecture Diagram](./architecture.png)
 
 ### Input Source Resolution
 
